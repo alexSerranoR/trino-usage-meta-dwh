@@ -12,7 +12,9 @@ statistics for Iceberg tables. It answers questions such as:
 
 Everything runs locally with Docker: Trino, an Iceberg REST catalog and
 S3-compatible object storage, plus a Python pipeline that builds the warehouse
-from realistic synthetic events and validates it with data quality checks.
+from realistic synthetic events and validates it with data quality checks. In live
+mode the same pipeline ingests the real query events of the bundled Trino through
+its HTTP event listener, so the warehouse monitors the cluster it runs on.
 
 ## Quick start
 
@@ -65,6 +67,7 @@ docker compose run --rm pipeline run --start 2026-10-01 --end 2026-10-31   # for
 docker compose run --rm pipeline check --start 2026-10-01 --end 2026-10-31
 docker compose run --rm pipeline maintain                                   # compact files, expire snapshots
 docker compose run --rm pipeline late-events --date 2026-10-20 --count 50   # simulate delayed delivery
+docker compose run --rm pipeline export-catalog --output /local/catalog.json  # catalog for AI agents
 docker compose run --rm pipeline query --list
 docker compose run --rm pipeline query 01_distinct_users_of_table --param table_fqn=iceberg.finance.invoices
 ```
@@ -72,11 +75,32 @@ docker compose run --rm pipeline query 01_distinct_users_of_table --param table_
 Trino is also reachable at `localhost:8080` for ad-hoc SQL, e.g.
 `docker compose exec trino trino`.
 
+### Live mode: real Trino events
+
+```bash
+export COMPOSE_FILE=docker-compose.yml:docker-compose.live.yml   # PowerShell: $env:COMPOSE_FILE = "docker-compose.yml;docker-compose.live.yml"
+docker compose up -d --build --wait
+docker compose run --rm pipeline init
+docker compose exec trino trino --user anna.petrova --execute "SELECT count(*) FROM iceberg.core.fct_query"
+docker compose run --rm pipeline sync
+```
+
+Trino's HTTP event listener posts every `QueryCompletedEvent` to the `collector`
+service, which buffers the events and writes them to `raw` in batches. The
+collector's own writes and the container health checks are ignored to avoid a
+feedback loop; the pipeline's queries are kept, so the warehouse also reports its
+own cost. Every payload is archived to `local/archive/events.jsonl`, and
+`docker compose exec collector metadwh replay /archive/events.jsonl` reloads it
+after a failure (staging deduplicates by `query_id`, so replays are safe). The
+parser is tested against payloads captured from Trino 476
+(`tests/fixtures/trino_476_query_completed_events.json`).
+
 ## Architecture
 
 ```mermaid
 flowchart LR
-    L[Trino event listener] --> R[raw.trino_query_completed]
+    L[Trino HTTP event listener] --> COL[collector]
+    COL --> R[raw.trino_query_completed]
     REF[reference<br/>teams, memberships, table registry] --> C
     R --> S[staging.query_completed<br/>deduplicated, normalized]
     S --> C[core<br/>facts and dimensions]
@@ -303,11 +327,28 @@ data can find the right table, know whether it is maintained and see which colum
 others use. The same table surfaces catalog gaps: unregistered tables in use, unused
 tables and missing descriptions (query `05`).
 
+`export-catalog` publishes this as one JSON document an agent can load as context or
+serve through a tool. For every monitored table it lists the description, owner,
+domain, PII flag, usage status, users, top teams and its columns ranked by how often
+they are read, plus explicit warnings ("contains personal data", "not in the
+registry", "may be deprecated"). It also documents the Meta DWH's own tables from
+their column comments, so an agent can query usage directly. Excerpt:
+
+```json
+{
+  "table": "iceberg.analytics.legacy_dau_v1",
+  "description": "Deprecated first version of daily active users. Superseded by daily_active_users.",
+  "owner_team": "product-analytics",
+  "usage": {"status": "never_used", "queries_30d": 0, "distinct_users_30d": 0},
+  "warnings": ["Not used recently; may be deprecated."]
+}
+```
+
 ## Assumptions
 
 - **Event source.** The raw table holds one row per `QueryCompletedEvent` from the
-  Trino event listener (for example the HTTP or Kafka listener), flattened into
-  columns. Field names mirror the event: `QueryMetadata` (query id, state, query
+  Trino event listener (HTTP in live mode; Kafka would work the same way), flattened
+  into columns. Field names mirror the event: `QueryMetadata` (query id, state, query
   text), `QueryContext` (user, source), `QueryStatistics` (CPU, wall, queued time,
   memory, bytes) and `QueryIOMetadata` (inputs with catalog, schema, table, columns
   and physical input bytes, and the output table). Only completed events are needed;
@@ -342,13 +383,15 @@ converting resources into cost.
   to a branch and publishing it, would make each step atomic.
 - At larger volumes, the planner could read per-partition statistics from Iceberg
   metadata tables instead of scanning raw, and raw could be partitioned by hour.
-- In the demo, events are written through Trino `INSERT` statements; in production
-  the event listener writes them directly.
+- The collector writes through Trino `INSERT` statements, which is simple and enough
+  for one cluster. At JetBrains scale, the Kafka event listener with a streaming
+  writer into Iceberg would decouple ingestion from the cluster being measured.
 
 ## Repository layout
 
 ```
 docker-compose.yml        Local stack: object storage, Iceberg REST catalog, Trino, pipeline
+docker-compose.live.yml   Live mode: Trino event listener and collector
 trino/catalog/            Trino Iceberg catalog configuration
 sql/ddl/                  Schemas and tables with column comments
 sql/transform/incremental Partition-rebuilding steps for a date window
@@ -356,7 +399,7 @@ sql/transform/full        Dimensions and profile rebuilt on every run
 sql/ops/                  Build planner and build state
 sql/checks/               Data quality checks
 sql/queries/              Example analytical queries
-metadwh/                  Pipeline runner and CLI
+metadwh/                  Pipeline runner, CLI, collector and catalog export
 metadwh/demo/             Synthetic event generator and reference data
 tests/                    Unit tests
 ```

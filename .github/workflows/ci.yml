@@ -30,6 +30,21 @@ jobs:
         run: |
           docker compose run --rm pipeline run --start 2026-10-10 --end 2026-10-20
           docker compose run --rm pipeline check
+      - name: Export the agent catalog
+        run: |
+          docker compose run --rm pipeline export-catalog --output /local/catalog.json
+          python3 -c "import json; assert json.load(open('local/catalog.json'))['datasets']"
+      - name: Ingest real query events in live mode
+        env:
+          COMPOSE_FILE: docker-compose.yml:docker-compose.live.yml
+        run: |
+          docker compose up -d --build --wait
+          docker compose exec -T trino trino --user ci.user --execute "SELECT count(*) FROM iceberg.core.fct_query"
+          sleep 10
+          docker compose run --rm pipeline sync
+          rows=$(docker compose exec -T trino trino --execute \
+            "SELECT count(*) FROM iceberg.core.fct_query WHERE user_name = 'ci.user'")
+          test "$rows" = '"1"'
       - name: Logs on failure
         if: failure()
         run: docker compose logs --tail 200

@@ -36,11 +36,17 @@ services:
 
   iceberg-rest:
     image: tabulario/iceberg-rest:1.6.0
+    # The catalog keeps table metadata in SQLite; by default it is in memory and lost on
+    # restart, so it is stored on a volume. Root is only needed to write that volume.
+    user: root
+    volumes:
+      - catalog-data:/catalog
     depends_on:
       create-bucket:
         condition: service_completed_successfully
     environment:
       <<: *s3-client
+      CATALOG_URI: jdbc:sqlite:file:/catalog/iceberg_catalog.db
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://object-storage:8333
@@ -79,3 +85,4 @@ services:
 
 volumes:
   object-storage-data:
+  catalog-data:

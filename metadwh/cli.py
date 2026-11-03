@@ -6,6 +6,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from metadwh import pipeline
@@ -155,6 +156,23 @@ def cmd_maintain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_collect(args: argparse.Namespace) -> int:
+    from metadwh import collector
+
+    ignored = {user.strip() for user in args.ignore_users.split(",") if user.strip()}
+    archive = Path(args.archive) if args.archive else None
+    collector.serve(_connect(), args.port, ignored, archive, flush_seconds=args.flush_seconds)
+    return 0
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    from metadwh import collector
+
+    ignored = {user.strip() for user in args.ignore_users.split(",") if user.strip()}
+    collector.replay(_connect(), Path(args.archive), ignored)
+    return 0
+
+
 def cmd_query(args: argparse.Namespace) -> int:
     if args.list or not args.name:
         for path in sorted(QUERIES_DIR.glob("*.sql")):
@@ -243,6 +261,19 @@ def build_parser() -> argparse.ArgumentParser:
     maintain = sub.add_parser("maintain", help="compact files and expire old snapshots")
     maintain.add_argument("--retention", default="7d", help="snapshot and orphan file retention")
     maintain.set_defaults(func=cmd_maintain)
+
+    collect = sub.add_parser("collect", help="receive events from the Trino HTTP event listener into raw")
+    collect.add_argument("--port", type=int, default=8000)
+    collect.add_argument("--ignore-users", default="meta_dwh_collector,healthcheck",
+                         help="comma-separated users whose queries are not recorded")
+    collect.add_argument("--archive", help="optional JSON Lines file that keeps every received payload")
+    collect.add_argument("--flush-seconds", type=float, default=5.0)
+    collect.set_defaults(func=cmd_collect)
+
+    replay = sub.add_parser("replay", help="load a collector archive into raw")
+    replay.add_argument("archive")
+    replay.add_argument("--ignore-users", default="meta_dwh_collector,healthcheck")
+    replay.set_defaults(func=cmd_replay)
 
     demo = sub.add_parser("demo", help="end-to-end demonstration on synthetic events")
     demo.add_argument("--seed", type=int, default=42)

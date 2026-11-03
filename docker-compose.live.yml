@@ -1,0 +1,25 @@
+# Live mode: Trino sends its own QueryCompletedEvents to the collector, which writes
+# them into raw. Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.live.yml up -d --wait
+
+services:
+  trino:
+    volumes:
+      - ./trino/live/config.properties:/etc/trino/config.properties:ro
+      - ./trino/live/http-event-listener.properties:/etc/trino/http-event-listener.properties:ro
+    healthcheck:
+      test: ["CMD", "trino", "--user", "healthcheck", "--execute", "SELECT 1"]
+
+  collector:
+    build: .
+    command: ["collect", "--archive", "/archive/events.jsonl"]
+    depends_on:
+      trino:
+        condition: service_healthy
+    environment:
+      TRINO_HOST: trino
+      TRINO_PORT: "8080"
+      TRINO_USER: meta_dwh_collector
+      TRINO_CATALOG: iceberg
+    volumes:
+      - ./local/archive:/archive

@@ -1,0 +1,79 @@
+name: meta-dwh
+
+# Local stack: SeaweedFS (S3-compatible object storage) + Iceberg REST catalog + Trino.
+# Credentials below are placeholders for local development only.
+
+x-s3-client: &s3-client
+  AWS_ACCESS_KEY_ID: admin
+  AWS_SECRET_ACCESS_KEY: password
+  AWS_REGION: us-east-1
+
+services:
+  object-storage:
+    image: chrislusf/seaweedfs:4.50
+    command: ["server", "-dir=/data", "-s3", "-s3.port=8333", "-volume.max=0"]
+    ports:
+      - "8333:8333"
+    volumes:
+      - object-storage-data:/data
+
+  create-bucket:
+    image: amazon/aws-cli:2.22.0
+    depends_on:
+      - object-storage
+    environment:
+      <<: *s3-client
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        for attempt in $$(seq 1 60); do
+          aws --endpoint-url http://object-storage:8333 s3api head-bucket --bucket warehouse 2>/dev/null && exit 0;
+          aws --endpoint-url http://object-storage:8333 s3 mb s3://warehouse && exit 0;
+          sleep 2;
+        done;
+        exit 1
+    restart: "no"
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    depends_on:
+      create-bucket:
+        condition: service_completed_successfully
+    environment:
+      <<: *s3-client
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://object-storage:8333
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "8181:8181"
+
+  trino:
+    image: trinodb/trino:476
+    depends_on:
+      - iceberg-rest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "SELECT 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  pipeline:
+    build: .
+    profiles: ["tools"]
+    depends_on:
+      trino:
+        condition: service_healthy
+    environment:
+      TRINO_HOST: trino
+      TRINO_PORT: "8080"
+      TRINO_USER: meta_dwh_pipeline
+      TRINO_CATALOG: iceberg
+
+volumes:
+  object-storage-data:

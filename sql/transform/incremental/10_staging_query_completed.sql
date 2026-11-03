@@ -21,15 +21,20 @@ SELECT
     upper(query_state)                                                 AS query_state,
     upper(query_type)                                                  AS query_type,
     error_code,
-    -- Literals are replaced so that executions of the same statement with different
-    -- parameters share one fingerprint.
-    to_hex(xxhash64(to_utf8(
+    -- Comments (BI tools add tracking comments) and literals are removed, and IN lists
+    -- of any length collapse to one placeholder, so executions of the same statement
+    -- with different parameters share one fingerprint.
+    to_hex(xxhash64(to_utf8(trim(
         regexp_replace(
             regexp_replace(
-                regexp_replace(lower(trim(query)), '''[^'']*''', '?'),
-                '\b\d+(\.\d+)?\b', '?'),
+                regexp_replace(
+                    regexp_replace(
+                        regexp_replace(lower(query), '(?s)/\*.*?\*/|--[^\n]*', ' '),
+                        '''[^'']*''', '?'),
+                    '\b\d+(\.\d+)?\b', '?'),
+                '\(\s*\?(\s*,\s*\?)*\s*\)', '(?)'),
             '\s+', ' ')
-    )))                                                                AS query_fingerprint,
+    ))))                                                               AS query_fingerprint,
     lower(trim(user_name))                                             AS user_name,
     source,
     create_time,

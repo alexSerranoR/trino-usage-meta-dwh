@@ -1,7 +1,7 @@
 -- Rebuilds staging partitions for [start_date, end_date].
 -- Deduplicates redelivered events and normalizes user and table identifiers.
--- Only events ingested up to the run's cutoff are read, so an event that lands while
--- the run is in progress is picked up by the next run instead of being half-processed.
+-- Raw is read as of the snapshot taken at the start of the run, so an event committed
+-- while the run is in progress is picked up by the next run instead of being missed.
 
 DELETE FROM iceberg.staging.query_completed
 WHERE query_date BETWEEN DATE '${start_date}' AND DATE '${end_date}';
@@ -11,10 +11,9 @@ WITH window_events AS (
     SELECT
         *,
         row_number() OVER (PARTITION BY query_id ORDER BY ingested_at DESC, end_time DESC) AS rn
-    FROM iceberg.raw.trino_query_completed
+    FROM iceberg.raw.trino_query_completed FOR VERSION AS OF ${raw_snapshot_id}
     WHERE create_time >= TIMESTAMP '${start_date} 00:00:00 UTC'
       AND create_time <  TIMESTAMP '${end_date} 00:00:00 UTC' + INTERVAL '1' DAY
-      AND ingested_at <= TIMESTAMP '${ingested_cutoff}'
 )
 SELECT
     query_id,

@@ -4,6 +4,8 @@ CREATE TABLE IF NOT EXISTS iceberg.ops.partition_builds (
     logic_version           varchar COMMENT 'Hash of the incremental SQL used for the build',
     source_max_ingested_at  timestamp(6) with time zone COMMENT 'Latest raw event ingestion time included',
     source_events           bigint  COMMENT 'Raw events for the date included in the build',
+    source_queries          bigint  COMMENT 'Distinct queries among those events',
+    raw_snapshot_id         bigint  COMMENT 'Iceberg snapshot of raw the build was read from',
     run_id                  varchar,
     built_at                timestamp(6) with time zone
 )

@@ -50,9 +50,10 @@ class LogicVersionTest(unittest.TestCase):
 
 
 class SqlLayoutTest(unittest.TestCase):
-    def test_staging_respects_ingestion_cutoff(self):
-        sql = (pipeline.INCREMENTAL_DIR / "10_staging_query_completed.sql").read_text(encoding="utf-8")
-        self.assertIn("${ingested_cutoff}", sql)
+    def test_raw_is_read_from_one_snapshot_per_run(self):
+        for path in [pipeline.INCREMENTAL_DIR / "10_staging_query_completed.sql",
+                     pipeline.OPS_DIR / "record_builds.sql", pipeline.OPS_DIR / "plan.sql"]:
+            self.assertIn("FOR VERSION AS OF ${raw_snapshot_id}", path.read_text(encoding="utf-8"), path.name)
 
     def test_incremental_steps_take_only_window_parameters(self):
         for path in pipeline.INCREMENTAL_DIR.glob("*.sql"):

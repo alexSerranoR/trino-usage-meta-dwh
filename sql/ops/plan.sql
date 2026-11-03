@@ -5,8 +5,7 @@ WITH source AS (
         CAST(create_time AT TIME ZONE 'UTC' AS date)  AS build_date,
         max(ingested_at)                              AS max_ingested_at,
         count(*)                                      AS events
-    FROM iceberg.raw.trino_query_completed
-    WHERE ingested_at <= TIMESTAMP '${ingested_cutoff}'
+    FROM iceberg.raw.trino_query_completed FOR VERSION AS OF ${raw_snapshot_id}
     GROUP BY 1
 )
 SELECT

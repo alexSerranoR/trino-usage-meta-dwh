@@ -1,9 +1,55 @@
-"""Rendering of synthetic query events as rows of the raw table."""
+"""Query completed events and their representation as rows of the raw table."""
 
 from __future__ import annotations
 
-from metadwh.demo.events import QueryEvent, TableInput
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+
 from metadwh.literals import literal
+from metadwh.sql_runner import SqlExecutor
+
+RAW_TABLE = "iceberg.raw.trino_query_completed"
+_BATCH_SIZE = 250
+
+
+@dataclass
+class TableInput:
+    catalog_name: str
+    schema_name: str
+    table_name: str
+    columns: list[str]
+    physical_input_bytes: int | None
+    physical_input_rows: int | None
+
+
+@dataclass
+class QueryEvent:
+    query_id: str
+    query_state: str
+    query_type: str | None
+    error_code: str | None
+    query: str
+    user_name: str
+    source: str | None
+    session_catalog: str | None
+    session_schema: str | None
+    create_time: datetime
+    execution_start_time: datetime | None
+    end_time: datetime
+    cpu_time_ms: int
+    wall_time_ms: int
+    queued_time_ms: int
+    peak_user_memory_bytes: int
+    cumulative_memory: float
+    physical_input_bytes: int
+    physical_input_rows: int
+    output_bytes: int
+    output_rows: int
+    inputs: list[TableInput] = field(default_factory=list)
+    output: tuple[str, str, str] | None = None
+    ingested_at: datetime | None = None
+
 
 INPUT_ROW_TYPE = (
     "row(catalog_name varchar, schema_name varchar, table_name varchar, "
@@ -68,3 +114,9 @@ def event_values(event: QueryEvent) -> str:
         literal(event.ingested_at),
     ]
     return "(" + ", ".join(values) + ")"
+
+
+def insert_events(executor: SqlExecutor, events: Sequence[QueryEvent]) -> None:
+    rows = [event_values(e) for e in events]
+    for offset in range(0, len(rows), _BATCH_SIZE):
+        executor.execute(f"INSERT INTO {RAW_TABLE} VALUES " + ",\n".join(rows[offset:offset + _BATCH_SIZE]))

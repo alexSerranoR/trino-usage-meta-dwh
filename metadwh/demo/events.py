@@ -10,51 +10,13 @@ from __future__ import annotations
 
 import random
 import string
-from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 
 from metadwh.demo.reference import AIRFLOW_OUTPUTS, TABLES, USERS, Table, User
+from metadwh.raw_events import QueryEvent, TableInput
 
 _ERROR_CODES = ["EXCEEDED_TIME_LIMIT", "EXCEEDED_USER_MEMORY_LIMIT", "SYNTAX_ERROR", "TABLE_NOT_FOUND"]
 _TABLES_BY_FQN = {table.fqn: table for table in TABLES}
-
-
-@dataclass
-class TableInput:
-    catalog_name: str
-    schema_name: str
-    table_name: str
-    columns: list[str]
-    physical_input_bytes: int | None
-    physical_input_rows: int | None
-
-
-@dataclass
-class QueryEvent:
-    query_id: str
-    query_state: str
-    query_type: str
-    error_code: str | None
-    query: str
-    user_name: str
-    source: str
-    session_catalog: str
-    session_schema: str
-    create_time: datetime
-    execution_start_time: datetime
-    end_time: datetime
-    cpu_time_ms: int
-    wall_time_ms: int
-    queued_time_ms: int
-    peak_user_memory_bytes: int
-    cumulative_memory: float
-    physical_input_bytes: int
-    physical_input_rows: int
-    output_bytes: int
-    output_rows: int
-    inputs: list[TableInput] = field(default_factory=list)
-    output: tuple[str, str, str] | None = None
-    ingested_at: datetime | None = None
 
 
 class EventGenerator:

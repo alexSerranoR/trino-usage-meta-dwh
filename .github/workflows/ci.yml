@@ -26,9 +26,24 @@ jobs:
         run: docker compose up -d --wait trino
       - name: Build the warehouse on synthetic events and run data quality checks
         run: docker compose run --rm pipeline demo
-      - name: Re-run a window and verify the checks still pass
+      - name: Re-run a window and verify the results are identical
         run: |
+          snapshot() {
+            docker compose exec -T trino trino --execute "
+              SELECT format('%s %s %s', count(*), sum(cpu_time_ms), to_hex(checksum(query_id)))
+              FROM iceberg.core.fct_query
+              UNION ALL
+              SELECT format('%s %.3f', count(*), sum(cpu_time_ms_allocated))
+              FROM iceberg.core.fct_query_table_access
+              UNION ALL
+              SELECT format('%s %s', count(*), sum(cpu_time_ms))
+              FROM iceberg.marts.team_usage_daily" | sort
+          }
+          before=$(snapshot)
           docker compose run --rm pipeline run --start 2026-10-10 --end 2026-10-20
+          after=$(snapshot)
+          echo "before: $before"; echo "after:  $after"
+          test "$before" = "$after"
           docker compose run --rm pipeline check
       - name: Export the agent catalog
         run: |

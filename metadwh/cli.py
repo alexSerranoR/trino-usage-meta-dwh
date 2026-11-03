@@ -13,6 +13,8 @@ from metadwh import pipeline
 from metadwh.config import SQL_DIR, TrinoSettings
 from metadwh.sql_runner import SqlExecutor, render
 
+log = logging.getLogger(__name__)
+
 DEMO_START = date(2026, 10, 1)
 DEMO_END = date(2026, 10, 31)
 LATE_EVENTS_DATE = date(2026, 10, 15)
@@ -173,6 +175,20 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_catalog(args: argparse.Namespace) -> int:
+    import json
+
+    from metadwh.catalog import build_catalog
+
+    document = json.dumps(build_catalog(_connect()), indent=2, ensure_ascii=False)
+    if args.output:
+        Path(args.output).write_text(document + "\n", encoding="utf-8")
+        log.info("Wrote catalog to %s", args.output)
+    else:
+        print(document)
+    return 0
+
+
 def cmd_query(args: argparse.Namespace) -> int:
     if args.list or not args.name:
         for path in sorted(QUERIES_DIR.glob("*.sql")):
@@ -274,6 +290,10 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("archive")
     replay.add_argument("--ignore-users", default="meta_dwh_collector,healthcheck")
     replay.set_defaults(func=cmd_replay)
+
+    export = sub.add_parser("export-catalog", help="JSON catalog of tables and their usage for AI agents")
+    export.add_argument("--output", help="file to write instead of standard output, e.g. /local/catalog.json")
+    export.set_defaults(func=cmd_export_catalog)
 
     demo = sub.add_parser("demo", help="end-to-end demonstration on synthetic events")
     demo.add_argument("--seed", type=int, default=42)

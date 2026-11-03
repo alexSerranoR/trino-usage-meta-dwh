@@ -74,6 +74,8 @@ services:
       TRINO_PORT: "8080"
       TRINO_USER: meta_dwh_pipeline
       TRINO_CATALOG: iceberg
+    volumes:
+      - ./local:/local
 
 volumes:
   object-storage-data:

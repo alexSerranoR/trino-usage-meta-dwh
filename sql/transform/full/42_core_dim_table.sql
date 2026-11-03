@@ -1,5 +1,6 @@
 -- Rebuilt in full on every run. Includes registered tables that were never read
--- and tables that were read but are missing from the registry.
+-- and tables that were read but are missing from the registry. Read dates come from
+-- the daily mart, which has one row per table and day instead of one per access.
 
 DELETE FROM iceberg.core.dim_table;
 
@@ -7,9 +8,9 @@ INSERT INTO iceberg.core.dim_table
 WITH observed AS (
     SELECT
         table_fqn,
-        min(query_date) AS first_read_date,
-        max(query_date) AS last_read_date
-    FROM iceberg.core.fct_query_table_access
+        min(usage_date) AS first_read_date,
+        max(usage_date) AS last_read_date
+    FROM iceberg.marts.table_usage_daily
     GROUP BY table_fqn
 ),
 registry AS (

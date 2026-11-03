@@ -24,9 +24,15 @@ docker compose run --rm --build pipeline demo
 ```
 
 `demo` creates all tables, loads one month of synthetic query events, builds every
-layer, runs the data quality checks and prints the example queries. Excerpt:
+layer, injects late events for one past day to show that only that day is rebuilt,
+compacts the tables, runs the data quality checks and prints the example queries.
+Excerpt:
 
 ```text
+== Initial build ==
+Plan: 31 date(s) to rebuild
+  not_built      31 date(s), 2026-10-01 .. 2026-10-31
+...
 PASS         01_fct_query_unique_query_id
 PASS         02_staging_complete
 PASS         03_cost_allocation_reconciles
@@ -34,21 +40,31 @@ PASS         04_team_mart_reconciles
 PASS         05_membership_no_overlaps
 PASS         06_no_missing_keys
 
+== Late events arrive for one past day ==
+Loaded 59 late events for 2026-10-15
+Plan: 1 date(s) to rebuild
+  2026-10-15  new_events     470 raw events
+...
+Plan: everything is up to date
+
 == 01_distinct_users_of_table ==
 table_fqn                            distinct_users_exact  distinct_users_hll  query_count
-iceberg.product_events.ide_sessions  15                    15                  2452
+iceberg.product_events.ide_sessions  15                    15                  2017
 
 == 02_team_resource_usage ==
 team_id            queries  failed_queries  distinct_users  cpu_hours  tib_scanned  memory_gib_hours  max_peak_memory_gib
-product-analytics  3674     105             6               57.01      11.281       5.33              12.01
+product-analytics  3594     120             6               50.96      11.054       4.75              12.02
 ```
 
 Other commands:
 
 ```bash
-docker compose run --rm pipeline run --date 2026-10-31 --lookback-days 3   # scheduled daily run
-docker compose run --rm pipeline run --start 2026-10-01 --end 2026-10-31   # backfill a range
+docker compose run --rm pipeline plan                                       # what is missing or stale, and why
+docker compose run --rm pipeline sync                                       # rebuild exactly those dates (scheduled run)
+docker compose run --rm pipeline run --start 2026-10-01 --end 2026-10-31   # force a rebuild of a range
 docker compose run --rm pipeline check --start 2026-10-01 --end 2026-10-31
+docker compose run --rm pipeline maintain                                   # compact files, expire snapshots
+docker compose run --rm pipeline late-events --date 2026-10-20 --count 50   # simulate delayed delivery
 docker compose run --rm pipeline query --list
 docker compose run --rm pipeline query 01_distinct_users_of_table --param table_fqn=iceberg.finance.invoices
 ```
@@ -66,6 +82,7 @@ flowchart LR
     S --> C[core<br/>facts and dimensions]
     C --> M[marts<br/>daily aggregates, table profile]
     M --> Q[reports, dashboards, AI agents]
+    OPS[ops<br/>build state, run log] -. plans .-> S
 ```
 
 | Layer | Purpose | Refresh |
@@ -75,9 +92,10 @@ flowchart LR
 | `staging` | One row per query: duplicates removed, users and table names normalized | Incremental, by date partition |
 | `core` | Star schema with facts at query and query-table grain | Facts incremental; dimensions full refresh |
 | `marts` | Pre-aggregated daily usage and a per-table usage profile | Daily aggregates incremental; profile full refresh |
+| `ops` | Build state of every date and an audit log of pipeline runs | Written by the pipeline |
 
 All tables are Iceberg tables in the `iceberg` catalog. Facts and aggregates are
-partitioned by date.
+partitioned by date and sorted by the column they are most often filtered on.
 
 ## Data model
 
@@ -102,6 +120,8 @@ erDiagram
 | `marts.table_usage_daily` | One row per (date, table) | queries, distinct users, HLL sketch of users, bytes, allocated CPU |
 | `marts.team_usage_daily` | One row per (date, team) | queries, distinct users, HLL sketch of users, CPU, wall, memory, bytes |
 | `marts.table_usage_profile` | One row per table | 30-day usage, top teams, top columns, usage status |
+| `ops.partition_builds` | One row per date | logic version, latest raw event and event count included in the build |
+| `ops.pipeline_runs` | One row per run | command, window, status, duration, error |
 
 Every table and column carries a `COMMENT` in its DDL (`sql/ddl`), so the meaning of
 each field is stored with the data and can be read through `SHOW CREATE TABLE` or
@@ -138,8 +158,8 @@ WHERE team_id = 'product-analytics'
   AND usage_date BETWEEN DATE '2026-10-01' AND DATE '2026-10-31';
 ```
 
-Further examples: weekly trend per team (`03`), tables ranked by compute cost (`04`)
-and catalog health findings (`05`).
+Further examples: weekly trend per team (`03`), tables ranked by compute cost (`04`),
+catalog health findings (`05`) and recurring query patterns ranked by cost (`06`).
 
 ## Design decisions
 
@@ -204,20 +224,62 @@ small row per day. Trino's default HLL has a standard error of about 1.6%. When 
 exact number is required, the query runs on `fct_query_table_access`, which is
 partitioned by date so the scan is limited to the requested period.
 
-### 6. Incremental updates, late events and backfills
+### 6. Incremental updates, late events and recalculations
 
-- Every incremental step deletes and rebuilds the date partitions in its window, so
-  running the same window twice yields the same result. Backfills and
-  recalculations after a logic change are the same command over a longer range.
-- Events arrive at least once and can arrive late. Staging keeps the latest copy of
-  each `query_id`. The scheduled daily run (`--date D --lookback-days 3`) reprocesses
-  the last few days so that late events are picked up.
-- Long ranges are processed in chunks (`--chunk-days`, default 7) to bound the size
-  of each statement.
-- Small dimensions and the usage profile are rebuilt in full on each run.
-- Running `demo` again over the same data reproduces identical results.
+Every incremental step deletes and rebuilds whole date partitions, so running the
+same window twice yields the same result. On top of that, the pipeline decides by
+itself which dates need work instead of reprocessing a fixed look-back window.
 
-### 7. Data quality checks
+`ops.partition_builds` records, for every date, the hash of the incremental SQL
+used to build it and the latest raw event it included. `plan` compares that state
+with raw and reports each date that is:
+
+| Reason | Meaning |
+|---|---|
+| `not_built` | Raw has events for a date that was never built |
+| `new_events` | Events for the date arrived after it was built (late or redelivered events) |
+| `logic_changed` | The transformation SQL changed since the date was built |
+
+`sync` rebuilds exactly those dates, grouping consecutive days into ranges. As a
+result:
+
+- **Late events** trigger a rebuild of only the days they belong to, however late
+  they arrive. The demo shows this: 59 events for 15 October arrive after the build
+  and only that day is rebuilt.
+- **Logic changes** are detected automatically. Changing the logic of any
+  incremental SQL file marks every date as `logic_changed`; edits to comments or
+  formatting do not, so a recalculation after a requirement change
+  is a single `sync`, and `plan` shows its scope before running it.
+- **Consistent cutoff.** Each run reads only events ingested up to a cutoff taken at
+  the start, and records that cutoff. An event arriving mid-run is picked up by the
+  next run rather than half-processed.
+- **Backfills** of any range use `run --start --end`; long ranges are processed in
+  chunks (`--chunk-days`, default 7) to bound the size of each statement.
+- Every run is logged in `ops.pipeline_runs` with its status, duration and error.
+- Small dimensions and the usage profile are rebuilt in full after each run.
+
+### 7. Query performance and storage layout
+
+- Facts and marts are partitioned by date, so period filters prune partitions.
+- Within each partition, files are sorted by the column most often filtered on
+  (`table_fqn` for table usage, `team_id` for team usage). Iceberg keeps min/max
+  statistics per file, so a filter on one table or team skips the files that cannot
+  contain it.
+- Period distinct counts read one HLL sketch per day instead of every access row.
+- `maintain` compacts small files and expires old snapshots and orphan files. Raw
+  receives many small appends; in the demo maintenance reduces it from 102 to 31
+  files, one per day.
+- The planner reads only two columns of raw (`create_time`, `ingested_at`).
+
+### 8. Repeated query patterns
+
+Staging computes a fingerprint of each statement after replacing string and numeric
+literals, so executions of the same dashboard or agent query with different
+parameters share one value. Query `06` ranks the recurring patterns by total CPU,
+with the users, teams and tables involved. Expensive patterns that many users run
+repeatedly are the natural candidates to turn into a reusable, pre-computed dataset.
+
+### 9. Data quality checks
 
 `sql/checks` contains checks that return the number of violating rows; the pipeline
 fails if any is not zero:
@@ -231,7 +293,7 @@ fails if any is not zero:
 | `05_membership_no_overlaps` | Overlapping memberships fanning out the team join |
 | `06_no_missing_keys` | Facts without a valid team or table |
 
-### 8. Metadata for people and AI agents
+### 10. Metadata for people and AI agents
 
 The warehouse also describes the tables it monitors. `marts.table_usage_profile`
 combines registry metadata (owner, domain, description, PII flag) with observed
@@ -257,8 +319,8 @@ tables and missing descriptions (query `05`).
   Views are attributed to the underlying tables that Trino actually reads.
 - **Users and teams.** The directory provides user-to-team history; a user belongs
   to one team at a time. Unknown users map to `unassigned`.
-- **Query text.** It may contain sensitive literals, so the core layer keeps a hash of
-  the normalized text (to group repeated queries) rather than the text itself.
+- **Query text.** It may contain sensitive literals, so the core layer keeps only the
+  fingerprint of the statement, not the text itself.
 
 ## Additional metadata required
 
@@ -273,15 +335,13 @@ converting resources into cost.
 
 ## Production considerations
 
-- Schedule `run --date {{ ds }} --lookback-days 3` daily in the orchestrator and run
-  `check` after it as a gate.
+- Schedule `sync` in the orchestrator (hourly or daily) followed by `check` as a gate,
+  and `maintain` daily.
 - Rebuilds use `DELETE` followed by `INSERT`, which are separate Iceberg commits.
   Readers could briefly see an empty partition; `MERGE` on the fact keys, or writing
   to a branch and publishing it, would make each step atomic.
-- Schedule Iceberg maintenance (`optimize`, `expire_snapshots`,
-  `remove_orphan_files`) for the frequently rewritten partitions.
-- At larger volumes, partition raw by hour and the facts by day with a sort order on
-  `table_fqn` and `team_id`.
+- At larger volumes, the planner could read per-partition statistics from Iceberg
+  metadata tables instead of scanning raw, and raw could be partitioned by hour.
 - In the demo, events are written through Trino `INSERT` statements; in production
   the event listener writes them directly.
 
@@ -293,6 +353,7 @@ trino/catalog/            Trino Iceberg catalog configuration
 sql/ddl/                  Schemas and tables with column comments
 sql/transform/incremental Partition-rebuilding steps for a date window
 sql/transform/full        Dimensions and profile rebuilt on every run
+sql/ops/                  Build planner and build state
 sql/checks/               Data quality checks
 sql/queries/              Example analytical queries
 metadwh/                  Pipeline runner and CLI

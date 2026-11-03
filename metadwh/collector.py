@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -129,34 +130,44 @@ def replay(executor: SqlExecutor, archive: Path, ignored_users: set[str]) -> int
     """Load every payload from a collector archive into raw, e.g. after a failed write.
 
     Re-loading events that are already in raw is safe: staging keeps one row per query_id.
+    Lines that cannot be parsed are skipped and reported instead of aborting the replay.
     """
     ingested_at = datetime.now(timezone.utc)
-    events = []
+    events, skipped = [], 0
     with archive.open(encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
+        for number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
                 event = parse_event(json.loads(line, parse_float=Decimal), ingested_at)
-                if event.user_name not in ignored_users:
-                    events.append(event)
+            except Exception as error:
+                skipped += 1
+                log.warning("Skipping line %d of %s: %s", number, archive, error)
+                continue
+            if event.user_name not in ignored_users:
+                events.append(event)
     insert_events(executor, events)
-    log.info("Replayed %d events from %s", len(events), archive)
+    log.info("Replayed %d events from %s (%d lines skipped)", len(events), archive, skipped)
     return len(events)
 
 
 class EventBuffer:
-    """Thread-safe buffer flushed to raw on a timer or when it reaches max_size."""
+    """Thread-safe buffer flushed to raw on a timer or when it reaches max_size.
 
-    def __init__(self, executor: SqlExecutor, ignored_users: set[str], max_size: int = 200) -> None:
+    A batch that keeps failing is dropped after max_attempts and logged; every accepted
+    payload is also in the archive, so it can be recovered with replay.
+    """
+
+    def __init__(self, executor: SqlExecutor, max_size: int = 200, max_attempts: int = 3) -> None:
         self._executor = executor
-        self._ignored_users = ignored_users
         self._max_size = max_size
+        self._max_attempts = max_attempts
         self._events: list[QueryEvent] = []
+        self._failures = 0
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
 
-    def add(self, payload: Mapping[str, Any]) -> None:
-        event = parse_event(payload, ingested_at=datetime.now(timezone.utc))
-        if event.user_name in self._ignored_users:
-            return
+    def add(self, event: QueryEvent) -> None:
         with self._lock:
             self._events.append(event)
             full = len(self._events) >= self._max_size
@@ -164,18 +175,28 @@ class EventBuffer:
             self.flush()
 
     def flush(self) -> int:
-        with self._lock:
-            events, self._events = self._events, []
-        if not events:
-            return 0
-        try:
-            insert_events(self._executor, events)
-        except Exception:
+        with self._flush_lock:
             with self._lock:
-                self._events = events + self._events
-            raise
-        log.info("Wrote %d events to raw", len(events))
-        return len(events)
+                events, self._events = self._events, []
+            if not events:
+                return 0
+            try:
+                insert_events(self._executor, events)
+            except Exception:
+                self._failures += 1
+                if self._failures >= self._max_attempts:
+                    log.exception(
+                        "Dropping %d events after %d failed writes; replay the archive to recover them",
+                        len(events), self._failures,
+                    )
+                    self._failures = 0
+                    return 0
+                with self._lock:
+                    self._events = events + self._events
+                raise
+            self._failures = 0
+            log.info("Wrote %d events to raw", len(events))
+            return len(events)
 
 
 def serve(
@@ -185,21 +206,25 @@ def serve(
     archive: Path | None,
     flush_seconds: float = 5.0,
 ) -> None:
-    buffer = EventBuffer(executor, ignored_users)
+    buffer = EventBuffer(executor)
     archive_lock = threading.Lock()
+
+    def accept(payload: Mapping[str, Any]) -> None:
+        event = parse_event(payload, ingested_at=datetime.now(timezone.utc))
+        if event.user_name in ignored_users:
+            return
+        if archive:
+            with archive_lock, archive.open("ab") as handle:
+                handle.write(json.dumps(payload, default=str).encode() + b"\n")
+        buffer.add(event)
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             try:
                 payload = json.loads(body, parse_float=Decimal)
-                payloads = payload if isinstance(payload, list) else [payload]
-                if archive:
-                    with archive_lock, archive.open("ab") as handle:
-                        for item in payloads:
-                            handle.write(json.dumps(item, default=str).encode() + b"\n")
-                for item in payloads:
-                    buffer.add(item)
+                for item in payload if isinstance(payload, list) else [payload]:
+                    accept(item)
             except Exception:
                 log.exception("Rejected event payload")
                 self.send_response(400)
@@ -213,7 +238,7 @@ def serve(
 
     def flush_periodically() -> None:
         while True:
-            threading.Event().wait(flush_seconds)
+            time.sleep(flush_seconds)
             try:
                 buffer.flush()
             except Exception:

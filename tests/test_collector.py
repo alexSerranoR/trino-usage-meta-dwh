@@ -3,8 +3,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from metadwh.collector import duration_ms, instant, parse_event
-from metadwh.raw_events import event_values
+from metadwh.collector import EventBuffer, duration_ms, instant, parse_event, replay
+from metadwh.raw_events import event_values, insert_rows
 
 # Payloads captured from the Trino 476 HTTP event listener, trimmed of query plans.
 FIXTURE = Path(__file__).parent / "fixtures" / "trino_476_query_completed_events.json"
@@ -65,6 +65,53 @@ class ParseRealEventTest(unittest.TestCase):
 
     def test_renders_as_raw_row(self):
         self.assertIn("'anna.petrova'", event_values(self.finished))
+
+
+class RecordingExecutor:
+    def __init__(self, fail: bool = False):
+        self.statements: list[str] = []
+        self.fail = fail
+
+    def execute(self, statement):
+        if self.fail:
+            raise RuntimeError("write failed")
+        self.statements.append(statement)
+
+
+class InsertRowsTest(unittest.TestCase):
+    def test_batches_are_bounded_by_size(self):
+        executor = RecordingExecutor()
+        insert_rows(executor, "t", ["(" + "x" * 300_000 + ")"] * 5)
+        self.assertGreater(len(executor.statements), 1)
+        self.assertTrue(all(len(s) < 1_000_000 for s in executor.statements))
+
+
+class EventBufferTest(unittest.TestCase):
+    def setUp(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+        self.event = parse_event(payload, datetime(2026, 11, 3, tzinfo=timezone.utc))
+
+    def test_failed_batch_is_retried_then_dropped(self):
+        buffer = EventBuffer(RecordingExecutor(fail=True), max_attempts=3)
+        buffer.add(self.event)
+        for _ in range(2):
+            with self.assertRaises(RuntimeError):
+                buffer.flush()
+        self.assertEqual(buffer.flush(), 0)
+        self.assertEqual(buffer.flush(), 0)
+
+
+class ReplayTest(unittest.TestCase):
+    def test_skips_unparseable_lines(self):
+        import tempfile
+
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))[0]
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "events.jsonl"
+            archive.write_text(json.dumps(payload) + "\n{not json}\n", encoding="utf-8")
+            executor = RecordingExecutor()
+            self.assertEqual(replay(executor, archive, ignored_users=set()), 1)
+            self.assertEqual(len(executor.statements), 1)
 
 
 if __name__ == "__main__":

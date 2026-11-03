@@ -10,7 +10,8 @@ from metadwh.literals import literal
 from metadwh.sql_runner import SqlExecutor
 
 RAW_TABLE = "iceberg.raw.trino_query_completed"
-_BATCH_SIZE = 250
+_BATCH_ROWS = 250
+_BATCH_CHARS = 800_000
 
 
 @dataclass
@@ -116,7 +117,23 @@ def event_values(event: QueryEvent) -> str:
     return "(" + ", ".join(values) + ")"
 
 
+def insert_rows(executor: SqlExecutor, table: str, rows: Sequence[str]) -> None:
+    """INSERT rows in batches bounded by row count and by statement size.
+
+    Trino rejects statements longer than query.max-length (1,000,000 characters by
+    default), and event rows carry full query texts, so batches are cut by size too.
+    """
+    batch: list[str] = []
+    size = 0
+    for row in rows:
+        if batch and (len(batch) >= _BATCH_ROWS or size + len(row) > _BATCH_CHARS):
+            executor.execute(f"INSERT INTO {table} VALUES " + ",\n".join(batch))
+            batch, size = [], 0
+        batch.append(row)
+        size += len(row) + 2
+    if batch:
+        executor.execute(f"INSERT INTO {table} VALUES " + ",\n".join(batch))
+
+
 def insert_events(executor: SqlExecutor, events: Sequence[QueryEvent]) -> None:
-    rows = [event_values(e) for e in events]
-    for offset in range(0, len(rows), _BATCH_SIZE):
-        executor.execute(f"INSERT INTO {RAW_TABLE} VALUES " + ",\n".join(rows[offset:offset + _BATCH_SIZE]))
+    insert_rows(executor, RAW_TABLE, [event_values(e) for e in events])

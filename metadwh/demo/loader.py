@@ -8,18 +8,10 @@ from datetime import date, datetime, time, timedelta, timezone
 from metadwh.demo.events import EventGenerator
 from metadwh.demo.reference import TABLES, TEAMS, USERS
 from metadwh.literals import literal
-from metadwh.raw_events import RAW_TABLE, insert_events
+from metadwh.raw_events import RAW_TABLE, insert_events, insert_rows
 from metadwh.sql_runner import SqlExecutor
 
 log = logging.getLogger(__name__)
-
-_BATCH_SIZE = 250
-
-
-def _insert(executor: SqlExecutor, table: str, rows: list[str]) -> None:
-    for offset in range(0, len(rows), _BATCH_SIZE):
-        executor.execute(f"INSERT INTO {table} VALUES " + ",\n".join(rows[offset:offset + _BATCH_SIZE]))
-
 
 def _row(*values: object) -> str:
     return "(" + ", ".join(literal(v) for v in values) + ")"
@@ -52,7 +44,7 @@ def load_reference(executor: SqlExecutor, start: date) -> None:
         ("iceberg.reference.table_registry", registry),
     ]:
         executor.execute(f"DELETE FROM {table}")
-        _insert(executor, table, rows)
+        insert_rows(executor, table, rows)
         log.info("Loaded %4d rows into %s", len(rows), table)
 
 

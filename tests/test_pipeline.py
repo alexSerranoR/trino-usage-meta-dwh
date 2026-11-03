@@ -22,7 +22,38 @@ class DateChunksTest(unittest.TestCase):
             pipeline.date_chunks(date(2026, 10, 5), date(2026, 10, 1), 7)
 
 
+class ContiguousRangesTest(unittest.TestCase):
+    def test_groups_consecutive_days(self):
+        days = [date(2026, 10, d) for d in (5, 1, 2, 3, 9, 10)]
+        self.assertEqual(
+            pipeline.contiguous_ranges(days),
+            [(date(2026, 10, 1), date(2026, 10, 3)), (date(2026, 10, 5), date(2026, 10, 5)),
+             (date(2026, 10, 9), date(2026, 10, 10))],
+        )
+
+    def test_empty(self):
+        self.assertEqual(pipeline.contiguous_ranges([]), [])
+
+
+class LogicVersionTest(unittest.TestCase):
+    def test_ignores_comments_and_formatting(self):
+        a = "-- old comment\nSELECT a,\n       b\nFROM t"
+        b = "-- reworded comment\nSELECT a, b FROM t  "
+        self.assertEqual(pipeline.normalized_sql(a), pipeline.normalized_sql(b))
+
+    def test_detects_logic_changes(self):
+        self.assertNotEqual(pipeline.normalized_sql("SELECT a FROM t"), pipeline.normalized_sql("SELECT b FROM t"))
+
+    def test_is_stable_short_hash(self):
+        self.assertEqual(pipeline.logic_version(), pipeline.logic_version())
+        self.assertEqual(len(pipeline.logic_version()), 12)
+
+
 class SqlLayoutTest(unittest.TestCase):
+    def test_staging_respects_ingestion_cutoff(self):
+        sql = (pipeline.INCREMENTAL_DIR / "10_staging_query_completed.sql").read_text(encoding="utf-8")
+        self.assertIn("${ingested_cutoff}", sql)
+
     def test_incremental_steps_take_only_window_parameters(self):
         for path in pipeline.INCREMENTAL_DIR.glob("*.sql"):
             sql = path.read_text(encoding="utf-8")

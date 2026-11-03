@@ -3,7 +3,8 @@ from collections import Counter
 from datetime import date
 
 from metadwh.demo.events import EventGenerator
-from metadwh.demo.sql_literals import event_values, literal, varchar_array
+from metadwh.demo.sql_literals import event_values, varchar_array
+from metadwh.literals import literal
 
 
 class EventGeneratorTest(unittest.TestCase):

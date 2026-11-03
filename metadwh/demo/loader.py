@@ -7,7 +7,8 @@ from datetime import date, datetime, time, timedelta, timezone
 
 from metadwh.demo.events import EventGenerator
 from metadwh.demo.reference import TABLES, TEAMS, USERS
-from metadwh.demo.sql_literals import event_values, literal
+from metadwh.demo.sql_literals import event_values
+from metadwh.literals import literal
 from metadwh.sql_runner import SqlExecutor
 
 log = logging.getLogger(__name__)
@@ -58,6 +59,19 @@ def load_reference(executor: SqlExecutor, start: date) -> None:
 def load_events(executor: SqlExecutor, start: date, end: date, seed: int, events_per_weekday: int) -> int:
     events = EventGenerator(start, end, seed=seed, events_per_weekday=events_per_weekday).generate()
     executor.execute("DELETE FROM iceberg.raw.trino_query_completed")
+    # Raw has been replaced, so no previous build reflects it any more.
+    executor.execute("DELETE FROM iceberg.ops.partition_builds")
     _insert(executor, "iceberg.raw.trino_query_completed", [event_values(e) for e in events])
     log.info("Loaded %d raw events (%s .. %s)", len(events), start, end)
+    return len(events)
+
+
+def load_late_events(executor: SqlExecutor, day: date, count: int, seed: int = 7) -> int:
+    """Append events for a past day that arrive now, as a delayed event stream would deliver them."""
+    events = EventGenerator(day, day, seed=seed, events_per_weekday=count).generate()
+    now = datetime.now(timezone.utc)
+    for event in events:
+        event.ingested_at = now
+    _insert(executor, "iceberg.raw.trino_query_completed", [event_values(e) for e in events])
+    log.info("Loaded %d late events for %s", len(events), day)
     return len(events)

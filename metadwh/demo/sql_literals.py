@@ -1,33 +1,15 @@
-"""Rendering of Python values as Trino SQL literals."""
+"""Rendering of synthetic query events as rows of the raw table."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from metadwh.demo.events import QueryEvent, TableInput
+from metadwh.literals import literal
 
 INPUT_ROW_TYPE = (
     "row(catalog_name varchar, schema_name varchar, table_name varchar, "
     "columns array(varchar), physical_input_bytes bigint, physical_input_rows bigint)"
 )
 OUTPUT_ROW_TYPE = "row(catalog_name varchar, schema_name varchar, table_name varchar)"
-
-
-def literal(value: object) -> str:
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return f"{value:.9e}"
-    if isinstance(value, datetime):
-        moment = value.astimezone(timezone.utc)
-        return f"TIMESTAMP '{moment:%Y-%m-%d %H:%M:%S.%f} UTC'"
-    if isinstance(value, str):
-        return "'" + value.replace("'", "''") + "'"
-    raise TypeError(f"Unsupported literal type: {type(value).__name__}")
 
 
 def varchar_array(values: list[str]) -> str:

@@ -3,3 +3,4 @@ CREATE SCHEMA IF NOT EXISTS iceberg.reference;
 CREATE SCHEMA IF NOT EXISTS iceberg.staging;
 CREATE SCHEMA IF NOT EXISTS iceberg.core;
 CREATE SCHEMA IF NOT EXISTS iceberg.marts;
+CREATE SCHEMA IF NOT EXISTS iceberg.ops;

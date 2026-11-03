@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from collections.abc import Sequence
-from datetime import date, timedelta
+from collections import Counter
+from collections.abc import Callable, Sequence
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from metadwh import pipeline
@@ -13,6 +14,7 @@ from metadwh.sql_runner import SqlExecutor, render
 
 DEMO_START = date(2026, 10, 1)
 DEMO_END = date(2026, 10, 31)
+LATE_EVENTS_DATE = date(2026, 10, 15)
 QUERIES_DIR = SQL_DIR / "queries"
 DEMO_QUERY_PARAMS = {
     "table_fqn": "iceberg.product_events.ide_sessions",
@@ -65,6 +67,44 @@ def _print_checks(results: list[pipeline.CheckResult]) -> bool:
     return all(r.passed for r in results)
 
 
+def _print_plan(planned: list[pipeline.PlannedDate]) -> None:
+    if not planned:
+        print("Plan: everything is up to date")
+        return
+    print(f"Plan: {len(planned)} date(s) to rebuild")
+    if len(planned) > 10:
+        reasons = Counter(p.reason for p in planned)
+        for reason, count in sorted(reasons.items()):
+            print(f"  {reason:<14} {count} date(s), {planned[0].build_date} .. {planned[-1].build_date}")
+        return
+    for item in planned:
+        print(f"  {item.build_date}  {item.reason:<14} {item.events} raw events")
+
+
+def _print_maintenance(results: list[pipeline.MaintenanceResult]) -> None:
+    print(_format_table(
+        ["table", "files_before", "files_after"],
+        [(r.table, r.files_before, r.files_after) for r in results],
+    ))
+
+
+def _audited(
+    executor: SqlExecutor,
+    command: str,
+    action: Callable[[], Any],
+    window: tuple[date, date] | None = None,
+) -> Any:
+    """Run an action and record its outcome in ops.pipeline_runs."""
+    started = datetime.now(timezone.utc)
+    try:
+        result = action()
+    except Exception as error:
+        pipeline.record_run(executor, command, started, error=f"{type(error).__name__}: {error}", window=window)
+        raise
+    pipeline.record_run(executor, command, started, error=None, window=window)
+    return result
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     pipeline.initialize(_connect())
     return 0
@@ -79,15 +119,40 @@ def cmd_seed(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_late_events(args: argparse.Namespace) -> int:
+    from metadwh.demo import loader
+
+    loader.load_late_events(_connect(), args.date, args.count)
+    return 0
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    _print_plan(pipeline.plan(_connect()))
+    return 0
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    executor = _connect()
+    _audited(executor, "sync", lambda: pipeline.sync(executor, chunk_days=args.chunk_days))
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
+    executor = _connect()
     start, end = _resolve_window(args)
-    pipeline.run(_connect(), start, end, chunk_days=args.chunk_days)
+    _audited(executor, "run", lambda: pipeline.run(executor, start, end, chunk_days=args.chunk_days), (start, end))
     return 0
 
 
 def cmd_check(args: argparse.Namespace) -> int:
     start, end = _resolve_window(args)
     return 0 if _print_checks(pipeline.run_checks(_connect(), start, end)) else 1
+
+
+def cmd_maintain(args: argparse.Namespace) -> int:
+    executor = _connect()
+    _print_maintenance(_audited(executor, "maintain", lambda: pipeline.maintain(executor, args.retention)))
+    return 0
 
 
 def cmd_query(args: argparse.Namespace) -> int:
@@ -108,8 +173,22 @@ def cmd_demo(args: argparse.Namespace) -> int:
     pipeline.initialize(executor)
     loader.load_reference(executor, DEMO_START)
     loader.load_events(executor, DEMO_START, DEMO_END, args.seed, args.events_per_weekday)
-    pipeline.run(executor, DEMO_START, DEMO_END)
+
+    print("\n== Initial build ==")
+    _print_plan(pipeline.plan(executor))
+    _audited(executor, "sync", lambda: pipeline.sync(executor))
     passed = _print_checks(pipeline.run_checks(executor, DEMO_START, DEMO_END))
+
+    print("\n== Late events arrive for one past day ==")
+    loader.load_late_events(executor, LATE_EVENTS_DATE, count=60)
+    _print_plan(pipeline.plan(executor))
+    _audited(executor, "sync", lambda: pipeline.sync(executor))
+    _print_plan(pipeline.plan(executor))
+    passed = _print_checks(pipeline.run_checks(executor, DEMO_START, DEMO_END)) and passed
+
+    print("\n== Table maintenance ==")
+    _print_maintenance(_audited(executor, "maintain", lambda: pipeline.maintain(executor)))
+
     for path in sorted(QUERIES_DIR.glob("*.sql")):
         _print_query(executor, path.stem, DEMO_QUERY_PARAMS)
     return 0 if passed else 1
@@ -135,7 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     seed.add_argument("--events-per-weekday", type=int, default=420)
     seed.set_defaults(func=cmd_seed)
 
-    run = sub.add_parser("run", help="build staging, core and marts for a date window")
+    run = sub.add_parser("run", help="rebuild a fixed date window (manual backfill)")
     _add_window_arguments(run)
     run.add_argument("--chunk-days", type=int, default=7, help="days processed per batch")
     run.set_defaults(func=cmd_run)
@@ -150,7 +229,22 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--list", action="store_true")
     query.set_defaults(func=cmd_query)
 
-    demo = sub.add_parser("demo", help="init, seed, run, check and print example queries")
+    late = sub.add_parser("late-events", help="append demo events for a past day that arrive now")
+    late.add_argument("--date", type=date.fromisoformat, default=LATE_EVENTS_DATE)
+    late.add_argument("--count", type=int, default=60)
+    late.set_defaults(func=cmd_late_events)
+
+    sub.add_parser("plan", help="show which dates are missing or stale and why").set_defaults(func=cmd_plan)
+
+    sync = sub.add_parser("sync", help="rebuild exactly the dates reported by plan")
+    sync.add_argument("--chunk-days", type=int, default=7, help="days processed per batch")
+    sync.set_defaults(func=cmd_sync)
+
+    maintain = sub.add_parser("maintain", help="compact files and expire old snapshots")
+    maintain.add_argument("--retention", default="7d", help="snapshot and orphan file retention")
+    maintain.set_defaults(func=cmd_maintain)
+
+    demo = sub.add_parser("demo", help="end-to-end demonstration on synthetic events")
     demo.add_argument("--seed", type=int, default=42)
     demo.add_argument("--events-per-weekday", type=int, default=420)
     demo.set_defaults(func=cmd_demo)

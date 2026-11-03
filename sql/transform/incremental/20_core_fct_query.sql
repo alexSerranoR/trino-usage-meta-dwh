@@ -31,7 +31,7 @@ SELECT
     q.output_table_fqn
 FROM iceberg.staging.query_completed AS q
 LEFT JOIN iceberg.reference.user_team_membership AS m
-    ON  m.user_name = q.user_name
+    ON  lower(trim(m.user_name)) = q.user_name
     AND q.create_time >= m.valid_from
     AND (m.valid_to IS NULL OR q.create_time < m.valid_to)
 WHERE q.query_date BETWEEN DATE '${start_date}' AND DATE '${end_date}';

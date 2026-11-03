@@ -1,5 +1,7 @@
 # Trino Usage Meta DWH
 
+[![ci](https://github.com/alexSerranoR/trino-usage-meta-dwh/actions/workflows/ci.yml/badge.svg)](https://github.com/alexSerranoR/trino-usage-meta-dwh/actions/workflows/ci.yml)
+
 A metadata warehouse that turns raw Trino query events into historical usage
 statistics for Iceberg tables. It answers questions such as:
 

@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: python -m unittest discover -s tests -t .
+
+  end-to-end:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start Trino, Iceberg REST catalog and object storage
+        run: docker compose up -d --wait trino
+      - name: Build the warehouse on synthetic events and run data quality checks
+        run: docker compose run --rm pipeline demo
+      - name: Re-run a window and verify the checks still pass
+        run: |
+          docker compose run --rm pipeline run --start 2026-10-10 --end 2026-10-20
+          docker compose run --rm pipeline check
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --tail 200

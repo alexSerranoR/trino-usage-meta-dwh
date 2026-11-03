@@ -1,5 +1,6 @@
--- Recurring query patterns ranked by total compute. Patterns that many users or
--- dashboards run over and over are candidates for a reusable, pre-computed data layer.
+-- Recurring query patterns ranked by total compute, including scheduled INSERT jobs.
+-- Patterns that many users or dashboards run over and over are candidates for a
+-- reusable, pre-computed data layer.
 WITH patterns AS (
     SELECT
         query_fingerprint,
@@ -11,7 +12,6 @@ WITH patterns AS (
         approx_percentile(wall_time_ms, 0.5) / 1.0E3    AS median_wall_seconds
     FROM iceberg.core.fct_query
     WHERE query_date BETWEEN DATE '${start_date}' AND DATE '${end_date}'
-      AND query_type = 'SELECT'
       AND input_table_count > 0
     GROUP BY query_fingerprint
     HAVING count(*) >= 20

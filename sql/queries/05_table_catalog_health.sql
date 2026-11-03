@@ -7,7 +7,8 @@ SELECT
     queries_30d,
     distinct_users_30d,
     CASE
-        WHEN owner_team_id IS NULL                          THEN 'unregistered table in use'
+        WHEN owner_team_id IS NULL AND queries_30d > 0      THEN 'unregistered table in use'
+        WHEN owner_team_id IS NULL                          THEN 'unregistered and unused'
         WHEN usage_status IN ('never_used', 'dormant')      THEN 'candidate for deprecation'
         WHEN coalesce(description, '') = ''                 THEN 'missing description'
     END                                                     AS finding

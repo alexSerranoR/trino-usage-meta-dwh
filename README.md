@@ -160,15 +160,16 @@ sequenceDiagram
     participant CLI as metadwh sync
     participant T as Trino
     participant OPS as ops.partition_builds
-    CLI->>T: max(ingested_at) in raw
-    T-->>CLI: ingestion cutoff
-    CLI->>T: plan.sql (raw vs build state)
+    CLI->>T: current snapshot of raw
+    T-->>CLI: raw snapshot id (the run reads raw as of it)
+    CLI->>T: plan.sql (raw snapshot vs build state)
     T-->>CLI: dates to rebuild and why
     loop each range of consecutive dates, in chunks of 7 days
-        CLI->>T: staging: dedupe and normalize (events up to the cutoff)
+        CLI->>OPS: forget the previous build of these dates
+        CLI->>T: staging: dedupe and normalize (raw as of the snapshot)
         CLI->>T: core: fct_query, fct_query_table_access
         CLI->>T: marts: table and team usage per day
-        CLI->>OPS: record logic version, cutoff and event count per date
+        CLI->>OPS: record logic version, snapshot and event counts per date
     end
     CLI->>T: rebuild dimensions and usage profile
     CLI->>T: log the run in ops.pipeline_runs
@@ -267,9 +268,10 @@ erDiagram
 | `ops.partition_builds` | One row per date | logic version, latest raw event and event count included in the build |
 | `ops.pipeline_runs` | One row per run | command, window, status, duration, error |
 
-Every table and column has a `COMMENT` in its DDL ([`sql/ddl`](sql/ddl)), so the
-meaning of each field is stored with the data and readable through
-`SHOW CREATE TABLE` or `information_schema`.
+The consumer-facing tables in `core`, `marts` and `ops` carry `COMMENT`s on the table
+and its key columns ([`sql/ddl`](sql/ddl)), so their meaning is stored with the data
+and readable through `SHOW CREATE TABLE` or `information_schema`; the agent catalog
+exports them.
 
 ---
 
@@ -318,7 +320,8 @@ WHERE team_id = 'product-analytics'
 | [`03_team_weekly_trend`](sql/queries/03_team_weekly_trend.sql) | How do CPU and users per team change week over week? Flags partial weeks. |
 | [`04_top_tables_by_cost`](sql/queries/04_top_tables_by_cost.sql) | Which tables drive compute cost, and how many people read them? |
 | [`05_table_catalog_health`](sql/queries/05_table_catalog_health.sql) | Which tables are unused, unregistered or missing a description? |
-| [`06_repeated_query_patterns`](sql/queries/06_repeated_query_patterns.sql) | Which recurring query patterns cost the most and should be pre-computed? |
+| [`06_repeated_query_patterns`](sql/queries/06_repeated_query_patterns.sql) | Which recurring query patterns, including scheduled jobs, cost the most and should be pre-computed? |
+| [`07_table_writers`](sql/queries/07_table_writers.sql) | Who writes table X, and what does producing it cost? |
 
 ---
 
@@ -358,8 +361,11 @@ cpu_time_ms_allocated  = cpu_time_ms × allocation_weight
 | `products` | 1 GB | 0.1 | 1.0 s |
 | **Total** | **10 GB** | **1.0** | **10.0 s** |
 
-- Bytes read are the best per-table cost signal Trino exposes. When no input reports
-  bytes, the cost is split evenly.
+- Bytes read are the best per-table cost signal the event exposes. If any input of a
+  query does not report bytes, proportional shares would give it nothing, so that
+  query's cost is split evenly instead.
+- Reads of Trino's own metadata (the `system` catalog and `information_schema`) are
+  not data tables and are left out of the access fact.
 - Weights always sum to 1, enforced by check `03_cost_allocation_reconciles`.
 - A table scanned several times in one query (self-joins) is merged into one row;
   `scan_count` records how many scans.
@@ -392,8 +398,11 @@ from 5 to 6, while October's first two weeks stay with marketing.
   dropped, which keeps totals complete and makes directory gaps visible.
 - Service accounts (Airflow, BI tools, agents) belong to a team like anyone else and
   are flagged with `account_type = 'service'`.
-- Check `05_membership_no_overlaps` guarantees a user has one team at a time, so the
-  point-in-time join cannot duplicate queries.
+- User names are normalized (trimmed, lower-cased) on both sides of the join.
+- Check `05_membership_no_overlaps` rejects overlapping periods, duplicated rows and
+  empty periods, so the point-in-time join cannot duplicate queries.
+- Teams removed from the directory stay in `dim_team` while they have history, so
+  past usage never loses its team.
 
 ### 4. Resource metrics
 
@@ -461,9 +470,13 @@ flowchart TD
   incremental SQL with comments and whitespace removed, so a real change marks every
   date as `logic_changed` while a reworded comment does not. A recalculation after a
   requirement change is a single `sync`, and `plan` shows its scope first.
-- **Consistent cutoff.** Each run reads only events ingested up to a cutoff taken at
-  the start and records it, so an event landing mid-run goes to the next run instead
-  of being half-processed.
+- **One raw snapshot per run.** At the start, the run takes the current Iceberg
+  snapshot of raw and every step (plan, staging, the build record) reads raw
+  `FOR VERSION AS OF` that snapshot. Events committed meanwhile are not half-processed;
+  they make the next `plan` report `new_events`.
+- **Failures cannot hide.** A run forgets the build record of its dates before
+  rebuilding them, so if a step fails half-way the dates show up as `not_built`
+  rather than as up to date.
 - **Backfills** of any range use `run --start --end`, processed in chunks
   (`--chunk-days`, default 7) to bound each statement.
 - **Audit.** Every run is logged in `ops.pipeline_runs` with status, duration and error.
@@ -493,20 +506,23 @@ flowchart LR
 
 ### 8. Repeated query patterns
 
-Staging fingerprints each statement after replacing string and numeric literals, so
-the same dashboard or agent query run with different parameters shares one value:
+Staging fingerprints each statement after removing comments (BI tools add tracking
+comments), replacing string and numeric literals and collapsing `IN` lists of any
+length, so the same dashboard, agent or scheduled query run with different
+parameters shares one value:
 
 ```mermaid
 flowchart LR
     A["SELECT ... FROM daily_active_users<br/>WHERE event_date >= DATE '2026-09-12'"] --> N
     B["SELECT ... FROM daily_active_users<br/>WHERE event_date >= DATE '2026-10-03'"] --> N
-    N["lower-case, literals → ?, whitespace collapsed<br/>SELECT ... WHERE event_date >= date ?"] --> H["xxhash64<br/>one fingerprint"]
+    N["lower-case, comments removed, literals → ?,<br/>IN lists → (?), whitespace collapsed<br/>SELECT ... WHERE event_date >= date ?"] --> H["xxhash64<br/>one fingerprint"]
 ```
 
 Query `06` ranks recurring patterns by total CPU with the users, teams and tables
 involved. In the demo, one agent pattern runs 160 times and costs 16 CPU hours a
-month over four tables: a clear candidate for a reusable, pre-computed dataset. Only
-the fingerprint is kept, never the query text, which may contain sensitive literals.
+month over four tables: a clear candidate for a reusable, pre-computed dataset. Core
+and marts keep only the fingerprint, not the query text, which may contain sensitive
+literals; the text stays in raw only (see assumptions on retention).
 
 ### 9. Data quality checks
 
@@ -533,10 +549,10 @@ flowchart LR
 | Check | Guards against |
 |---|---|
 | `01_fct_query_unique_query_id` | Duplicate events reaching the facts |
-| `02_staging_complete` | Events lost between raw, staging and core |
+| `02_staging_complete` | Events lost or duplicated between the raw snapshot each date was built from, staging and core |
 | `03_cost_allocation_reconciles` | Allocated cost not adding up to the query cost |
 | `04_team_mart_reconciles` | Marts drifting from the facts |
-| `05_membership_no_overlaps` | Overlapping memberships fanning out the team join |
+| `05_membership_no_overlaps` | Overlapping, duplicated or empty memberships fanning out the team join |
 | `06_no_missing_keys` | Facts without a valid team or table |
 
 Each check returns the number of violating rows; `check` fails if any is not zero.
@@ -607,9 +623,13 @@ sequenceDiagram
   are ignored. The pipeline's queries are kept, so the warehouse also reports its own
   cost; as a result the current day always has new events, as expected for a day
   that is not over.
-- **Recoverable.** Every payload is archived; `docker compose exec collector metadwh
-  replay /archive/events.jsonl` reloads it after a failure. Staging deduplicates by
-  `query_id`, so replays are safe.
+- **Recoverable writes.** Every accepted payload is archived before it is buffered.
+  Batches are bounded in size to stay under Trino's statement limit; a batch that
+  keeps failing is dropped after three attempts and can be recovered with
+  `docker compose exec collector metadwh replay /archive/events.jsonl`. Staging
+  deduplicates by `query_id`, so replays are safe, and unreadable lines are skipped.
+  Events Trino cannot deliver while the collector is down are lost after the
+  listener's retries; the Kafka listener would make delivery durable.
 - **Validated against real payloads.** The parser is tested with events captured
   from Trino 476 ([`tests/fixtures`](tests/fixtures)). Capturing them revealed that
   Trino 476 serializes durations as decimal seconds (`"0.757000000"`), which the
@@ -631,7 +651,10 @@ sequenceDiagram
 | Tables | Event inputs are already resolved to fully qualified names, so no SQL parsing is needed. Names are lower-cased to merge spellings. Views are attributed to the underlying tables Trino reads. |
 | Multiple sources | A query reading several tables gets one access row per table and its cost is split by bytes read (decision 2). |
 | Users and teams | The directory provides user-to-team history; a user belongs to one team at a time. Unknown users map to `unassigned`. |
-| Query text | May contain sensitive literals, so only its fingerprint is kept. |
+| Query text | May contain sensitive literals. Core and marts keep only its fingerprint; raw keeps the text as delivered and should get a retention policy (or masking) separate from the rest of raw. |
+| Retention | Raw is the source of truth for rebuilds and is retained; expiring it would make older dates impossible to recalculate. |
+| Clusters | One cluster. With several, the event's `environment` would be added to the key, since `query_id` is only unique per cluster. |
+| Not yet used | The event also carries `principal` (impersonation), `groups` and the resource group, which could map users to teams without a directory, and the snapshot id of each table read, which would show data freshness. |
 
 ### Additional metadata required
 
@@ -653,6 +676,10 @@ resources into cost.
 - **Atomic rebuilds.** Rebuilds are a `DELETE` followed by an `INSERT`, two Iceberg
   commits; readers could briefly see an empty partition. `MERGE` on the fact keys, or
   writing to an Iceberg branch and publishing it, would make each step atomic.
+- **Concurrency.** Two `sync` runs, or `maintain` during a `sync`, should not overlap;
+  the orchestrator's single-instance scheduling or a lock row in `ops` would enforce it.
+- **Time zone.** Days are UTC. Teams working in European time would get a local
+  calendar column for reporting, without changing partitions.
 - **Planner at scale.** The planner could read per-partition statistics from Iceberg
   metadata tables instead of scanning two columns of raw, and raw could be
   partitioned by hour.
@@ -684,6 +711,9 @@ All commands run as `docker compose run --rm pipeline <command>`.
 | `late-events --date D --count N` | Simulate delayed delivery for a past day |
 | `collect` / `replay FILE` | Receive live events / reload an archive (collector) |
 
+`run` also accepts `--date D --lookback-days N` for orchestrators that pass a run date;
+scheduled runs should prefer `sync`, which needs no look-back window.
+
 ### Repository layout
 
 ```
@@ -713,11 +743,11 @@ All commands run as `docker compose run --rm pipeline <command>`.
 ```mermaid
 flowchart LR
     subgraph J1[lint-and-test]
-        L[ruff] --> UT[38 unit tests]
+        L[ruff] --> UT[41 unit tests]
     end
     subgraph J2[end-to-end on a clean runner]
         UP[start the stack] --> DEMO[demo with quality checks]
-        DEMO --> RR[re-run a window and re-check]
+        DEMO --> RR[re-run a window:<br/>identical results]
         RR --> EX[export and validate the catalog]
         EX --> LIVE[live mode: a real query reaches fct_query]
     end

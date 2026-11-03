@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS iceberg.core.fct_query (
     output_table_fqn           varchar COMMENT 'Written table for INSERT / CTAS queries'
 )
 COMMENT 'Executed queries. Grain: one row per query.'
-WITH (partitioning = ARRAY['query_date']);
+WITH (partitioning = ARRAY['query_date'], sorted_by = ARRAY['team_id', 'user_name']);
 
 CREATE TABLE IF NOT EXISTS iceberg.core.fct_query_table_access (
     query_id                   varchar COMMENT 'FK to fct_query',
@@ -71,4 +71,4 @@ CREATE TABLE IF NOT EXISTS iceberg.core.fct_query_table_access (
     cumulative_memory_allocated double COMMENT 'cumulative_memory * allocation_weight'
 )
 COMMENT 'Tables read by each query. Grain: one row per (query, table).'
-WITH (partitioning = ARRAY['query_date']);
+WITH (partitioning = ARRAY['query_date'], sorted_by = ARRAY['table_fqn']);

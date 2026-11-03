@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS iceberg.marts.table_usage_daily (
     cpu_time_ms_allocated  double
 )
 COMMENT 'Daily usage per table. Grain: one row per (date, table).'
-WITH (partitioning = ARRAY['usage_date']);
+WITH (partitioning = ARRAY['usage_date'], sorted_by = ARRAY['table_fqn']);
 
 CREATE TABLE IF NOT EXISTS iceberg.marts.team_usage_daily (
     usage_date              date    COMMENT 'Partition key',
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS iceberg.marts.team_usage_daily (
     output_bytes            bigint
 )
 COMMENT 'Daily resource consumption per team. Grain: one row per (date, team).'
-WITH (partitioning = ARRAY['usage_date']);
+WITH (partitioning = ARRAY['usage_date'], sorted_by = ARRAY['team_id']);
 
 CREATE TABLE IF NOT EXISTS iceberg.marts.table_usage_profile (
     table_fqn              varchar,

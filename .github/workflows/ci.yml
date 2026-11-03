@@ -40,11 +40,16 @@ jobs:
         run: |
           docker compose up -d --build --wait
           docker compose exec -T trino trino --user ci.user --execute "SELECT count(*) FROM iceberg.core.fct_query"
-          sleep 10
+          for attempt in $(seq 1 40); do
+            received=$(docker compose exec -T trino trino --execute \
+              "SELECT count(*) FROM iceberg.raw.trino_query_completed WHERE user_name = 'ci.user'")
+            [ "$received" != '"0"' ] && break
+            sleep 3
+          done
           docker compose run --rm pipeline sync
           rows=$(docker compose exec -T trino trino --execute \
             "SELECT count(*) FROM iceberg.core.fct_query WHERE user_name = 'ci.user'")
           test "$rows" = '"1"'
       - name: Logs on failure
         if: failure()
-        run: docker compose logs --tail 200
+        run: docker compose -f docker-compose.yml -f docker-compose.live.yml logs --tail 200

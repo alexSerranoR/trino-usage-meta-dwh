@@ -1,7 +1,15 @@
--- A user belongs to at most one team at any point in time, so the point-in-time join cannot fan out.
+-- A user belongs to at most one team at any point in time, so the point-in-time join
+-- cannot fan out. Catches overlapping periods, duplicated rows with the same start,
+-- and empty or inverted periods.
 SELECT count(*) AS failures
-FROM iceberg.reference.user_team_membership AS a
-JOIN iceberg.reference.user_team_membership AS b
-    ON  a.user_name = b.user_name
-    AND a.valid_from < b.valid_from
-    AND (a.valid_to IS NULL OR a.valid_to > b.valid_from)
+FROM (
+    SELECT
+        valid_from,
+        valid_to,
+        lead(valid_from) OVER (
+            PARTITION BY lower(trim(user_name)) ORDER BY valid_from, valid_to
+        ) AS next_valid_from
+    FROM iceberg.reference.user_team_membership
+)
+WHERE (next_valid_from IS NOT NULL AND (valid_to IS NULL OR next_valid_from < valid_to))
+   OR (valid_to IS NOT NULL AND valid_to <= valid_from)

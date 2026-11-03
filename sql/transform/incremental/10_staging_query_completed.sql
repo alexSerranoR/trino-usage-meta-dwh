@@ -19,7 +19,15 @@ SELECT
     upper(query_state)                                                 AS query_state,
     upper(query_type)                                                  AS query_type,
     error_code,
-    to_hex(xxhash64(to_utf8(lower(regexp_replace(trim(query), '\s+', ' '))))) AS query_hash,
+    -- Literals are replaced so that executions of the same statement with different
+    -- parameters share one fingerprint.
+    to_hex(xxhash64(to_utf8(
+        regexp_replace(
+            regexp_replace(
+                regexp_replace(lower(trim(query)), '''[^'']*''', '?'),
+                '\b\d+(\.\d+)?\b', '?'),
+            '\s+', ' ')
+    )))                                                                AS query_fingerprint,
     lower(trim(user_name))                                             AS user_name,
     source,
     create_time,

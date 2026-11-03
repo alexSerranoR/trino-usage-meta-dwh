@@ -64,6 +64,8 @@ class EventGenerator:
         self.events_per_weekday = events_per_weekday
         self._rng = random.Random(seed)
         self._sequence = 0
+        # Dashboards and agents re-run a fixed set of statements: (tables, columns per table).
+        self._templates: dict[str, list[tuple[list[Table], list[list[str]]]]] = {}
 
     def generate(self) -> list[QueryEvent]:
         events: list[QueryEvent] = []
@@ -85,6 +87,7 @@ class EventGenerator:
         create_time = self._create_time(day, user)
         source = rng.choice(user.sources)
         user_name = user.name.title() if rng.random() < 0.03 else user.name
+        column_sets: list[list[str]] | None = None
 
         if user.name == "svc_airflow" and rng.random() < 0.7:
             output_fqn, input_fqns = rng.choice(AIRFLOW_OUTPUTS)
@@ -94,9 +97,15 @@ class EventGenerator:
             output_fqn, query_type, tables = None, "SELECT", []
         else:
             output_fqn, query_type = None, "SELECT"
-            tables = self._pick_tables(self._team_on(user, day))
+            if user.account_type == "service" and rng.random() < 0.85:
+                tables, column_sets = self._recurring_query(user, self._team_on(user, day))
+            else:
+                tables = self._pick_tables(self._team_on(user, day))
 
-        inputs = [self._table_input(table, user) for table in tables]
+        inputs = [
+            self._table_input(table, user, column_sets[index] if column_sets else None)
+            for index, table in enumerate(tables)
+        ]
         if tables and rng.random() < 0.05:
             inputs.append(self._table_input(tables[0], user))
 
@@ -164,13 +173,24 @@ class EventGenerator:
                 picked.append(table)
         return picked
 
-    def _table_input(self, table: Table, user: User) -> TableInput:
+    def _recurring_query(self, user: User, team_id: str) -> tuple[list[Table], list[list[str]]]:
+        templates = self._templates.setdefault(user.name, [])
+        if len(templates) < 12:
+            tables = self._pick_tables(team_id)
+            templates.append((tables, [self._columns(table) for table in tables]))
+            return templates[-1]
+        return self._rng.choice(templates)
+
+    def _columns(self, table: Table) -> list[str]:
+        width = self._rng.randint(2, len(table.columns))
+        return sorted(self._rng.sample(list(table.columns), width), key=table.columns.index)
+
+    def _table_input(self, table: Table, user: User, columns: list[str] | None = None) -> TableInput:
         rng = self._rng
         catalog, schema, name = table.fqn.split(".")
         if rng.random() < 0.04:
             schema = schema.title()
-        width = rng.randint(2, len(table.columns))
-        columns = sorted(rng.sample(list(table.columns), width), key=table.columns.index)
+        columns = columns or self._columns(table)
         # Service accounts tend to scan full partitions; people filter more.
         fraction = rng.uniform(0.5, 1.2) if user.account_type == "service" else rng.uniform(0.05, 0.6)
         scanned = int(rng.lognormvariate(0, 0.8) * table.scan_bytes_median * fraction)

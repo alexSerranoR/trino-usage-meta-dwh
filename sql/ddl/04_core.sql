@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS iceberg.core.fct_query (
     query_state                varchar COMMENT 'FINISHED or FAILED',
     query_type                 varchar COMMENT 'SELECT, INSERT, ...',
     error_code                 varchar,
-    query_hash                 varchar COMMENT 'Hash of the normalized query text, to group repeated queries',
+    query_fingerprint          varchar COMMENT 'Hash of the query text with literals removed; groups repeated query patterns',
     create_time                timestamp(6) with time zone,
     end_time                   timestamp(6) with time zone,
     cpu_time_ms                bigint  COMMENT 'Total CPU time across all workers',

@@ -15,7 +15,7 @@ SELECT
     q.query_state,
     q.query_type,
     q.error_code,
-    q.query_hash,
+    q.query_fingerprint,
     q.create_time,
     q.end_time,
     coalesce(q.cpu_time_ms, 0)                            AS cpu_time_ms,

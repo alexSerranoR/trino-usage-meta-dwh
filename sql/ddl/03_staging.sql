@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS iceberg.staging.query_completed (
     query_state             varchar,
     query_type              varchar,
     error_code              varchar,
-    query_hash              varchar,
+    query_fingerprint       varchar,
     user_name               varchar,
     source                  varchar,
     create_time             timestamp(6) with time zone,
